@@ -1,0 +1,4 @@
+{
+  "api_key": "sk-your-litellm-api-key-here",
+  "url": "http://localhost:4000"
+}
