@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""LiteLLM configuration tool for opencode.json format.
+"""Configuration tool for opencode.json format.
 
-Connects to a LiteLLM proxy instance and outputs models configuration
+Connects to LiteLLM or NVIDIA NIM providers and outputs models configuration
 in the opencode.json format.
 """
 
@@ -14,30 +14,23 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 
 
-# LiteLLM model cost map for known model token limits
-# Source: https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json
-LITELLM_COST_MAP = {
-    "gpt-4": {"context": 8192, "output": 4096},
-    "gpt-4-32k": {"context": 32768, "output": 4096},
-    "gpt-4-turbo": {"context": 128000, "output": 4096},
-    "gpt-4o": {"context": 128000, "output": 4096},
-    "gpt-4o-mini": {"context": 128000, "output": 16384},
-    "gpt-3.5-turbo": {"context": 16385, "output": 4096},
-    "gpt-3.5-turbo-16k": {"context": 16385, "output": 4096},
-    "claude-3-opus": {"context": 200000, "output": 4096},
-    "claude-3-sonnet": {"context": 200000, "output": 4096},
-    "claude-3-haiku": {"context": 200000, "output": 4096},
-    "claude-3-5-sonnet": {"context": 200000, "output": 8192},
-    "claude-3-5-haiku": {"context": 200000, "output": 4096},
-    "gemini-pro": {"context": 32760, "output": 8192},
-    "gemini-1.5-pro": {"context": 2000000, "output": 8192},
-    "gemini-1.5-flash": {"context": 1000000, "output": 8192},
+# Provider defaults
+DEFAULTS = {
+    "litellm": {
+        "url": "http://localhost:4000",
+    },
+    "nvidia_nim": {
+        "url": "https://integrate.api.nvidia.com",
+    },
 }
+
+# Default token limits for models without specific info
+DEFAULT_LIMITS = {"context": 128000, "output": 4096}
 
 
 def get_config_file_path() -> str:
     """Get the path to the config file.
-    
+
     Priority:
     1. LITELLM_CFG_CONFIG env var
     2. ./.litellm-cfg.json (current directory)
@@ -47,18 +40,18 @@ def get_config_file_path() -> str:
     env_path = os.environ.get("LITELLM_CFG_CONFIG")
     if env_path:
         return env_path
-    
+
     # Check current directory
     local_config = ".litellm-cfg.json"
     if os.path.exists(local_config):
         return local_config
-    
+
     # Check user config directory
     home = os.path.expanduser("~")
     user_config = os.path.join(home, ".config", "litellm-cfg", "config.json")
     if os.path.exists(user_config):
         return user_config
-    
+
     return ""
 
 
@@ -77,20 +70,30 @@ def load_config_file(config_path: str) -> Dict[str, Any]:
         return {}
 
 
-def get_token_limits_from_cost_map(model_id: str) -> Optional[Dict[str, int]]:
-    """Try to get token limits from LiteLLM cost map based on model ID patterns."""
-    model_lower = model_id.lower()
+def get_provider_config(config: Dict[str, Any], provider: str) -> Dict[str, Any]:
+    """Extract provider-specific configuration from config dict.
 
-    # Check for exact matches first
-    if model_id in LITELLM_COST_MAP:
-        return LITELLM_COST_MAP[model_id]
+    Supports both nested and flat config formats:
+    - Nested: {"providers": {"litellm": {"api_key": "..."}}}
+    - Flat: {"api_key": "...", "url": "..."} (backward compatible)
+    """
+    result = {}
 
-    # Check for pattern matches
-    for pattern, limits in LITELLM_COST_MAP.items():
-        if pattern in model_lower:
-            return limits
+    # Try nested format first: providers.{provider_name}
+    providers = config.get("providers", {})
+    if provider in providers:
+        provider_config = providers[provider]
+        if isinstance(provider_config, dict):
+            result.update(provider_config)
 
-    return None
+    # Fall back to flat format for backward compatibility
+    # (only for litellm provider to maintain existing behavior)
+    if provider == "litellm" and not result:
+        for key in ["api_key", "url"]:
+            if key in config:
+                result[key] = config[key]
+
+    return result
 
 
 def make_request(url: str, headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
@@ -141,6 +144,24 @@ def fetch_models_from_litellm(
     raise ConnectionError("Failed to fetch models from LiteLLM")
 
 
+def fetch_models_from_nim(base_url: str, api_key: str) -> List[Dict[str, Any]]:
+    """Fetch models from NVIDIA NIM API.
+
+    NVIDIA NIM uses OpenAI-compatible /v1/models endpoint.
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # NVIDIA NIM uses /v1/models endpoint (OpenAI compatible)
+    models_data = make_request(f"{base_url}/v1/models", headers)
+    if models_data and "data" in models_data:
+        return models_data["data"]
+
+    raise ConnectionError("Failed to fetch models from NVIDIA NIM")
+
+
 def extract_model_name_from_id(model_id: str) -> str:
     """Extract a display name from model ID."""
     # Handle provider/model format (e.g., "openai/gpt-4")
@@ -150,7 +171,7 @@ def extract_model_name_from_id(model_id: str) -> str:
     return model_id
 
 
-def build_models_config(
+def build_models_config_litellm(
     models: List[Dict[str, Any]], model_info_list: Optional[List[Dict[str, Any]]]
 ) -> Dict[str, Any]:
     """Build opencode.json models section from LiteLLM model data."""
@@ -198,9 +219,9 @@ def build_models_config(
                     "output": max_output or 4096,
                 }
 
-        # Fall back to cost map lookup
+        # Fall back to default limits
         if limits is None:
-            limits = get_token_limits_from_cost_map(model_id)
+            limits = DEFAULT_LIMITS.copy()
 
         # Add limits if we found them
         if limits:
@@ -211,10 +232,96 @@ def build_models_config(
     return models_config
 
 
+def build_models_config_nim(models: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build opencode.json models section from NVIDIA NIM model data."""
+    models_config = {}
+
+    for model in models:
+        model_id = model.get("id", "")
+        if not model_id:
+            continue
+
+        # Build the model entry
+        model_entry = {
+            "name": extract_model_name_from_id(model_id),
+        }
+
+        # Use default limits for all NIM models
+        model_entry["limit"] = DEFAULT_LIMITS.copy()
+
+        models_config[model_id] = model_entry
+
+    return models_config
+
+
+def resolve_config(
+    provider: str,
+    cli_api_key: Optional[str],
+    cli_url: Optional[str],
+    file_config: Dict[str, Any],
+) -> tuple[str, str]:
+    """Resolve configuration values using priority order.
+
+    Priority (highest to lowest):
+    1. CLI arguments
+    2. Config file (nested or flat)
+    3. Environment variables
+    4. Default values
+    """
+    # Get provider-specific config from file
+    provider_config = get_provider_config(file_config, provider)
+
+    # Environment variable names based on provider
+    env_api_key_vars = {
+        "litellm": "LITELLM_API_KEY",
+        "nvidia_nim": ["NIM_API_KEY", "NVIDIA_NIM_API_KEY", "NV_API_KEY"],
+    }
+    env_url_vars = {
+        "litellm": "LITELLM_URL",
+        "nvidia_nim": ["NIM_URL", "NVIDIA_NIM_URL", "NV_URL"],
+    }
+
+    # Resolve API key
+    api_key = cli_api_key  # CLI arg (highest priority)
+    if not api_key:
+        api_key = provider_config.get("api_key")  # Config file
+    if not api_key:
+        # Try environment variables
+        env_vars = env_api_key_vars.get(provider, [f"{provider.upper()}_API_KEY"])
+        if isinstance(env_vars, str):
+            env_vars = [env_vars]
+        for var in env_vars:
+            api_key = os.environ.get(var)
+            if api_key:
+                break
+
+    # Resolve URL
+    url = cli_url  # CLI arg (highest priority)
+    if not url:
+        url = provider_config.get("url")  # Config file
+    if not url:
+        # Try environment variables
+        env_vars = env_url_vars.get(provider, [f"{provider.upper()}_URL"])
+        if isinstance(env_vars, str):
+            env_vars = [env_vars]
+        for var in env_vars:
+            url = os.environ.get(var)
+            if url:
+                break
+    if not url:
+        url = DEFAULTS.get(provider, {}).get("url", "")  # Default
+
+    # Remove trailing slash if present
+    if url:
+        url = url.rstrip("/")
+
+    return api_key, url
+
+
 def main() -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Fetch models from LiteLLM and output opencode.json format"
+        description="Fetch models from LLM providers and output opencode.json format"
     )
     parser.add_argument(
         "-m",
@@ -224,18 +331,26 @@ def main() -> int:
         help="Fetch and output models configuration",
     )
     parser.add_argument(
+        "-p",
+        "--provider",
+        type=str,
+        choices=["litellm", "nvidia_nim"],
+        default="litellm",
+        help="Provider to fetch models from (default: litellm)",
+    )
+    parser.add_argument(
         "-a",
         "--api-key",
         type=str,
         default=None,
-        help="API key for LiteLLM (highest priority)",
+        help="API key for the provider (highest priority)",
     )
     parser.add_argument(
         "-u",
         "--url",
         type=str,
         default=None,
-        help="LiteLLM base URL (highest priority)",
+        help="Provider base URL (highest priority)",
     )
     parser.add_argument(
         "-c",
@@ -251,43 +366,49 @@ def main() -> int:
     config_file_path = args.config or get_config_file_path()
     file_config = load_config_file(config_file_path) if config_file_path else {}
 
-    # Priority order (highest to lowest):
-    # 1. CLI args
-    # 2. Config file
-    # 3. Environment variables
-    # 4. Default values
-    
-    # Get API key
-    api_key = args.api_key  # CLI arg (highest)
+    # Resolve configuration
+    api_key, base_url = resolve_config(
+        args.provider, args.api_key, args.url, file_config
+    )
+
     if not api_key:
-        api_key = file_config.get("api_key")  # Config file
-    if not api_key:
-        api_key = os.environ.get("LITELLM_API_KEY")  # Environment
-    
-    if not api_key:
-        print("Error: API key required. Use -a/--api-key, config file, or set LITELLM_API_KEY env var", file=sys.stderr)
+        provider_display = args.provider.replace("_", " ").title()
+        print(
+            f"Error: API key required for {provider_display}. Use -a/--api-key, config file, or set environment variable",
+            file=sys.stderr,
+        )
         return 1
 
-    # Get base URL
-    base_url = args.url  # CLI arg (highest)
     if not base_url:
-        base_url = file_config.get("url")  # Config file
-    if not base_url:
-        base_url = os.environ.get("LITELLM_URL", "http://localhost:4000")  # Environment or default
-    
-    # Remove trailing slash if present
-    base_url = base_url.rstrip("/")
+        print(f"Error: URL required for {args.provider}", file=sys.stderr)
+        return 1
 
     try:
-        # Fetch models from LiteLLM
-        models, model_info = fetch_models_from_litellm(base_url, api_key)
+        if args.provider == "litellm":
+            # Fetch models from LiteLLM
+            models, model_info = fetch_models_from_litellm(base_url, api_key)
 
-        if not models:
-            print("Error: No models found in LiteLLM response", file=sys.stderr)
+            if not models:
+                print("Error: No models found in LiteLLM response", file=sys.stderr)
+                return 1
+
+            # Build opencode.json models section
+            models_config = build_models_config_litellm(models, model_info)
+
+        elif args.provider == "nvidia_nim":
+            # Fetch models from NVIDIA NIM
+            models = fetch_models_from_nim(base_url, api_key)
+
+            if not models:
+                print("Error: No models found in NVIDIA NIM response", file=sys.stderr)
+                return 1
+
+            # Build opencode.json models section
+            models_config = build_models_config_nim(models)
+
+        else:
+            print(f"Error: Unknown provider '{args.provider}'", file=sys.stderr)
             return 1
-
-        # Build opencode.json models section
-        models_config = build_models_config(models, model_info)
 
         # Output as JSON to stdout
         print(json.dumps(models_config, indent=2))
